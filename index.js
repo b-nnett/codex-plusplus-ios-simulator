@@ -16,11 +16,29 @@
 "use strict";
 
 const TWEAK_ATTR = "data-codexpp-ios-sim";
+const OTHER_CUSTOM_PANEL_ATTRS = ["data-codexpp-android-emu"];
+const CUSTOM_PANEL_ATTRS = [TWEAK_ATTR, ...OTHER_CUSTOM_PANEL_ATTRS];
+const CUSTOM_MENU_ATTRS = [TWEAK_ATTR, "data-codexpp-android-emu"];
+const CUSTOM_PANEL_PREV_DISPLAY_ATTR = "data-codexpp-custom-panel-prev-display";
+const CUSTOM_PANEL_HOST_ATTR = "data-codexpp-custom-panel-host";
+const ACTIVE_CUSTOM_PANEL_ATTR = "data-codexpp-active-custom-panel";
+const LEGACY_PANEL_PREV_DISPLAY_ATTRS = [
+  "data-codexpp-ios-sim-prev-display",
+  "data-codexpp-android-emu-prev-display",
+];
 const STYLE_ID = "codexpp-ios-sim-style";
 const MENU_LABEL = "iOS Simulator";
 const PANEL_LABEL = "iOS Simulator";
 const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
 const PICKER_TITLE_PATTERNS = [/^new chat$/i, /^open file$/i, /^browse files$/i];
+const FALLBACK_MENU_TEXT_PATTERNS = [
+  /^\+?new chat\b/i,
+  /^open file\b/i,
+  /^browse files\b/i,
+  /^terminal\b/i,
+  /^review\b/i,
+  /^settings\b/i,
+];
 const PICKER_SUBTITLE = "Mirror the iOS Simulator in this pane";
 
 const PHONE_SVG =
@@ -76,8 +94,16 @@ module.exports = {
 
     await api.react.waitForElement?.("body", 10_000);
 
-    this.observer = new MutationObserver(() => this.installMenuEntries());
-    this.observer.observe(document.body, { childList: true, subtree: true });
+    this.observer = new MutationObserver(() => {
+      this.installMenuEntries();
+      reconcileActiveCustomPanelFromDom();
+    });
+    this.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-selected", "class", "data-selected", "style"],
+    });
     this.cleanup.push(() => this.observer?.disconnect());
 
     this.installMenuEntries();
@@ -98,17 +124,19 @@ module.exports = {
   },
 
   installMenuEntries() {
+    wireNativeBrowserButtons();
+
     for (const browserButton of findBrowserMenuButtons()) {
-      if (browserButton.nextElementSibling?.getAttribute(TWEAK_ATTR) === "menu-entry") {
-        continue;
-      }
+      if (hasExistingMenuEntry(browserButton)) continue;
       const simButton = browserButton.cloneNode(true);
       simButton.setAttribute(TWEAK_ATTR, "menu-entry");
       simButton.setAttribute("aria-label", MENU_LABEL);
       rewriteMenuEntry(simButton);
 
       const activate = (event) => {
+        if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
+        event.stopImmediatePropagation?.();
         event.stopPropagation();
         // The same gesture fires pointerdown → mousedown → click. We listen
         // to all three (capture phase) so we win over Codex's React handlers,
@@ -123,7 +151,10 @@ module.exports = {
 
       simButton.addEventListener("pointerdown", activate, true);
       simButton.addEventListener("mousedown", activate, true);
+      simButton.addEventListener("pointerup", activate, true);
+      simButton.addEventListener("mouseup", activate, true);
       simButton.addEventListener("click", activate, true);
+      simButton.addEventListener("keydown", activate, true);
       browserButton.insertAdjacentElement("afterend", simButton);
     }
   },
@@ -584,6 +615,35 @@ function injectStyles() {
     [${TWEAK_ATTR}="tabpanel"] {
       background: var(--color-background-panel, var(--color-token-bg-fog));
     }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel] > :not(:first-child):not(.h-toolbar):not([role="status"]):not([data-codexpp-ios-sim="tabpanel"]):not([data-codexpp-android-emu="tabpanel"]) {
+      display: none !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel] > [role="tabpanel"]:not([data-codexpp-ios-sim="tabpanel"]):not([data-codexpp-android-emu="tabpanel"]) {
+      display: none !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-ios-sim"] > [data-codexpp-ios-sim="tabpanel"],
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-android-emu"] > [data-codexpp-android-emu="tabpanel"] {
+      display: flex !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-ios-sim"] > [data-codexpp-android-emu="tabpanel"],
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-android-emu"] > [data-codexpp-ios-sim="tabpanel"] {
+      display: none !important;
+    }
+    body[${ACTIVE_CUSTOM_PANEL_ATTR}] [data-browser-sidebar-webview] {
+      height: 1px !important;
+      left: -10000px !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      top: 0 !important;
+      visibility: hidden !important;
+      width: 1px !important;
+      z-index: -1 !important;
+    }
+    body[${ACTIVE_CUSTOM_PANEL_ATTR}] [data-browser-sidebar-webview] > webview {
+      opacity: 0 !important;
+      pointer-events: none !important;
+      visibility: hidden !important;
+    }
     [${TWEAK_ATTR}="toolbar-button"] {
       display: inline-flex;
       align-items: center;
@@ -633,6 +693,9 @@ function findBrowserMenuButtons() {
     if (!(node instanceof HTMLElement)) continue;
     if (node.getAttribute(TWEAK_ATTR)) continue;
     if (!isMenuCandidate(node)) continue;
+    if (!isVisibleElement(node)) continue;
+    const menuRoot = closestFloatingMenuRoot(node);
+    if (!(menuRoot instanceof HTMLElement) || !isSidePanelAddMenuRoot(menuRoot)) continue;
     if (
       matchesBrowserText(extractLabel(node)) ||
       matchesBrowserText(compactText(node.textContent || ""))
@@ -650,6 +713,7 @@ function findBrowserMenuButtons() {
     for (const row of rows) {
       if (!(row instanceof HTMLElement)) continue;
       if (row.getAttribute(TWEAK_ATTR)) continue;
+      if (!isVisibleElement(row)) continue;
       const title = compactText(
         row.querySelector("[data-codexpp-spitscreen-picker-title]")?.textContent ||
           row.querySelector("span")?.textContent ||
@@ -666,7 +730,113 @@ function findBrowserMenuButtons() {
     }
   }
 
+  if (found.size === 0) {
+    for (const fallback of findFallbackMenuButtons()) {
+      found.add(fallback);
+    }
+  }
+
   return Array.from(found);
+}
+
+function findNativeBrowserButtons() {
+  const found = new Set();
+  const candidates = Array.from(
+    document.querySelectorAll(
+      '[role="menuitem"], [role="menu"] button, [data-radix-popper-content-wrapper] button, [role="dialog"] button, [role="dialog"] [role="button"]',
+    ),
+  );
+
+  for (const node of candidates) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (isCustomMenuEntry(node)) continue;
+    if (!isMenuCandidate(node)) continue;
+    if (!isVisibleElement(node)) continue;
+    if (
+      matchesBrowserText(extractLabel(node)) ||
+      matchesBrowserText(compactText(node.textContent || ""))
+    ) {
+      found.add(node);
+    }
+  }
+
+  return Array.from(found);
+}
+
+function wireNativeBrowserButtons() {
+  for (const button of findNativeBrowserButtons()) {
+    if (button.__codexppIosSimBrowserWired) continue;
+    button.__codexppIosSimBrowserWired = true;
+    const prepare = (event) => {
+      if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+      prepareNativeSidebarAction();
+    };
+    button.addEventListener("pointerdown", prepare, true);
+    button.addEventListener("mousedown", prepare, true);
+    button.addEventListener("pointerup", prepare, true);
+    button.addEventListener("mouseup", prepare, true);
+    button.addEventListener("click", prepare, true);
+    button.addEventListener("keydown", prepare, true);
+  }
+}
+
+function findFallbackMenuButtons() {
+  const found = new Set();
+  const roots = Array.from(
+    document.querySelectorAll(
+      '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]',
+    ),
+  );
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    if (!isVisibleElement(root)) continue;
+    if (!isSidePanelAddMenuRoot(root)) continue;
+    const candidates = Array.from(
+      root.querySelectorAll('[role="menuitem"], button, [role="button"]'),
+    ).filter(isFallbackMenuCandidate);
+    if (!candidates.length) continue;
+    const preferred =
+      candidates.find((node) =>
+        FALLBACK_MENU_TEXT_PATTERNS.some((pattern) => pattern.test(extractLabel(node))),
+      ) || candidates[0];
+    found.add(preferred);
+  }
+
+  return Array.from(found);
+}
+
+function closestFloatingMenuRoot(node) {
+  if (!(node instanceof HTMLElement)) return null;
+  return node.closest(
+    '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]',
+  );
+}
+
+function isSidePanelAddMenuRoot(root) {
+  if (!(root instanceof HTMLElement)) return false;
+  const addButton = findSidePanelAddButton();
+  if (!(addButton instanceof HTMLElement)) return false;
+
+  const rootRect = root.getBoundingClientRect();
+  const addRect = addButton.getBoundingClientRect();
+  if (!rootRect.width || !rootRect.height || !addRect.width || !addRect.height) return false;
+
+  const addCenterX = addRect.left + addRect.width / 2;
+  const horizontallyAnchored =
+    rootRect.left <= addCenterX + 80 && rootRect.right >= addCenterX - 80;
+  const verticallyAnchored =
+    rootRect.top <= addRect.bottom + 360 && rootRect.bottom >= addRect.top - 24;
+
+  return horizontallyAnchored && verticallyAnchored;
+}
+
+function hasExistingMenuEntry(origin) {
+  const parent = origin.parentElement;
+  if (!parent) return false;
+  return Array.from(parent.children).some(
+    (node) => node !== origin && node.getAttribute?.(TWEAK_ATTR) === "menu-entry",
+  );
 }
 
 function isMenuCandidate(node) {
@@ -678,6 +848,27 @@ function isMenuCandidate(node) {
       '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]',
     ),
   );
+}
+
+function isFallbackMenuCandidate(node) {
+  if (!(node instanceof HTMLElement)) return false;
+  if (isCustomMenuEntry(node)) return false;
+  if (!isMenuCandidate(node)) return false;
+  if (!isVisibleElement(node)) return false;
+  if (node.matches("[disabled]") || node.getAttribute("aria-disabled") === "true") return false;
+  const text = extractLabel(node);
+  if (/^(close|dismiss|cancel|back)$/i.test(text)) return false;
+  return Boolean(text || node.querySelector("svg"));
+}
+
+function isCustomMenuEntry(node) {
+  return CUSTOM_MENU_ATTRS.some((attr) => Boolean(node.closest(`[${attr}]`)));
+}
+
+function isVisibleElement(node) {
+  const style = window.getComputedStyle?.(node);
+  if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+  return node.getClientRects().length > 0;
 }
 
 function rewriteMenuEntry(button) {
@@ -718,7 +909,41 @@ function rewriteMenuLabel(button) {
       break;
     }
   }
+  if (setTitle) {
+    removeShortcutHints(button);
+    return;
+  }
+
+  let setFallbackTitle = false;
+  const isPickerRow = Boolean(button.closest('[role="dialog"]'));
+  for (const node of textNodes) {
+    const text = compactText(node.nodeValue || "");
+    if (!isRewriteableMenuText(text)) continue;
+    if (!setFallbackTitle) {
+      node.nodeValue = MENU_LABEL;
+      setFallbackTitle = true;
+      if (!isPickerRow) break;
+      continue;
+    }
+    node.nodeValue = PICKER_SUBTITLE;
+    break;
+  }
+  if (setFallbackTitle) {
+    removeShortcutHints(button);
+    return;
+  }
+
+  const label = document.createElement("span");
+  label.textContent = MENU_LABEL;
+  button.appendChild(label);
   removeShortcutHints(button);
+}
+
+function isRewriteableMenuText(text) {
+  if (!text || text === MENU_LABEL) return false;
+  if (/^[⌘⇧⌥⌃^]+/.test(text) || /Cmd|Ctrl|Alt|Shift|⌘/.test(text)) return false;
+  if (!/[A-Za-z]/.test(text)) return false;
+  return true;
 }
 
 function rewriteMenuIcon(button) {
@@ -763,6 +988,10 @@ function closeTransientMenu(origin) {
 
 function openSimPanel(api) {
   ensureSidePanelVisible();
+  retryMountSimPanel(api, Date.now());
+}
+
+function retryMountSimPanel(api, startedAt) {
   // NOTE: requestAnimationFrame is paused when the window is unfocused, which
   // prevented mounting when the user tabbed away. setTimeout fires regardless.
   setTimeout(() => {
@@ -772,14 +1001,20 @@ function openSimPanel(api) {
     } catch (err) {
       api?.log?.error?.("ios-sim mountSimPanel threw", String(err?.stack || err));
     }
-    if (!mounted) api?.log?.warn?.("ios-sim could not find side panel host");
-  }, 16);
+    if (mounted) return;
+    if (Date.now() - startedAt < 2500) {
+      ensureSidePanelVisible();
+      retryMountSimPanel(api, startedAt);
+      return;
+    }
+    api?.log?.warn?.("ios-sim could not find side panel host");
+  }, 80);
 }
 
 function mountSimPanel(api) {
   const tablist = findRightTablist();
   if (!(tablist instanceof HTMLElement)) return false;
-  const panelHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
+  const panelHost = findPanelHostForTablist(tablist);
   if (!(panelHost instanceof HTMLElement)) return false;
   installNativeTabDeactivation(tablist, panelHost);
   installTablistDrag(tablist);
@@ -863,7 +1098,9 @@ function createSideTab() {
 
   button.append(iconSpan, close, labelSpan);
   button.addEventListener("click", () => {
-    const panelHost = controller.closest(".flex.h-full.min-h-0.flex-col");
+    const tablist = controller.closest('[role="tablist"]');
+    const panelHost =
+      tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
     const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
     if (panelHost instanceof HTMLElement && panel instanceof HTMLElement) {
       activateSimPanel(panelHost, controller, panel);
@@ -903,7 +1140,9 @@ function createSideTab() {
 }
 
 function closeSimTab() {
-  const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
@@ -950,7 +1189,7 @@ function installNativeTabDeactivation(tablist, panelHost) {
     const target = event.target instanceof Element ? event.target : null;
     const tab = target?.closest?.('[role="tab"]');
     if (!(tab instanceof HTMLElement)) return;
-    if (tab.closest(`[${TWEAK_ATTR}="side-tab"]`)) return;
+    if (tab.closest(customTabSelector())) return;
     deactivateSimPanel(panelHost);
   };
 
@@ -1189,32 +1428,115 @@ function makeToolbarButton({ label, icon, text, onClick }) {
   return b;
 }
 
-function activateSimPanel(panelHost, tab, panel) {
-  for (const nativePanel of panelHost.querySelectorAll(
-    ':scope > [role="tabpanel"]',
-  )) {
-    if (nativePanel === panel) continue;
-    if (!nativePanel.hasAttribute("data-codexpp-ios-sim-prev-display")) {
+function customPanelSelector() {
+  return CUSTOM_PANEL_ATTRS.map((attr) => `[${attr}="tabpanel"]`).join(",");
+}
+
+function customTabSelector() {
+  return CUSTOM_PANEL_ATTRS.map((attr) => `[${attr}="side-tab"]`).join(",");
+}
+
+function isCustomPanel(panel) {
+  return CUSTOM_PANEL_ATTRS.some((attr) => panel.hasAttribute(attr));
+}
+
+function detachPanelCapture(panel) {
+  try {
+    panel.__codexppIosSimDetachCapture?.();
+  } catch {}
+  try {
+    panel.__codexppAndroidEmuDetachCapture?.();
+  } catch {}
+}
+
+function setSideTabSelected(tabWrap, selected) {
+  const tab = tabWrap?.querySelector?.('[role="tab"]');
+  if (selected) tabWrap?.setAttribute?.("data-selected", "true");
+  else tabWrap?.removeAttribute?.("data-selected");
+  tab?.setAttribute("aria-selected", selected ? "true" : "false");
+  tab?.classList.toggle("text-token-text-primary", selected);
+  tab?.classList.toggle("text-token-text-secondary", !selected);
+}
+
+function hidePanelsForCustomTab(panelHost, activePanel) {
+  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
+    if (nativePanel === activePanel) continue;
+    if (isCustomPanel(nativePanel)) {
+      nativePanel.style.display = "none";
+      detachPanelCapture(nativePanel);
+      continue;
+    }
+    if (!nativePanel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
       nativePanel.setAttribute(
-        "data-codexpp-ios-sim-prev-display",
-        nativePanel.style.display || "",
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(nativePanel) ?? nativePanel.style.display ?? "",
       );
     }
+    clearLegacyPanelDisplayAttrs(nativePanel);
     nativePanel.style.display = "none";
   }
+}
+
+function restoreNativePanels(panelHost) {
+  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
+    if (isCustomPanel(nativePanel)) continue;
+    const previous =
+      nativePanel.getAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR) ??
+      legacyPanelDisplayValue(nativePanel);
+    if (previous !== null) {
+      nativePanel.style.display = previous;
+      nativePanel.removeAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR);
+      clearLegacyPanelDisplayAttrs(nativePanel);
+    }
+  }
+}
+
+function legacyPanelDisplayValue(panel) {
+  for (const attr of LEGACY_PANEL_PREV_DISPLAY_ATTRS) {
+    const value = panel.getAttribute(attr);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function clearLegacyPanelDisplayAttrs(panel) {
+  for (const attr of LEGACY_PANEL_PREV_DISPLAY_ATTRS) panel.removeAttribute(attr);
+}
+
+function prepareNativeSidebarAction() {
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
+  if (!(panelHost instanceof HTMLElement)) return;
+  clearActiveCustomPanelFlag(panelHost);
+
+  for (const customTab of document.querySelectorAll(customTabSelector())) {
+    setSideTabSelected(customTab, false);
+  }
+  for (const customPanel of panelHost.querySelectorAll(customPanelSelector())) {
+    if (!(customPanel instanceof HTMLElement)) continue;
+    customPanel.style.display = "none";
+    detachPanelCapture(customPanel);
+  }
+  restoreNativePanels(panelHost);
+}
+
+function activateSimPanel(panelHost, tab, panel) {
+  deactivateNativeBrowserSurface(panelHost);
+  hidePanelsForCustomTab(panelHost, panel);
 
   for (const nativeTab of panelHost.querySelectorAll('[role="tab"]')) {
     nativeTab.setAttribute("aria-selected", "false");
     nativeTab.classList.remove("text-token-text-primary");
     nativeTab.classList.add("text-token-text-secondary");
   }
+  for (const customTab of document.querySelectorAll(customTabSelector())) {
+    if (customTab !== tab) setSideTabSelected(customTab, false);
+  }
 
-  const tabButton = tab.querySelector('[role="tab"]');
-  tab.dataset.selected = "true";
-  tabButton?.setAttribute("aria-selected", "true");
-  tabButton?.classList.remove("text-token-text-secondary");
-  tabButton?.classList.add("text-token-text-primary");
+  setSideTabSelected(tab, true);
   panel.style.display = "";
+  scheduleCustomPanelReconcile(panelHost);
   // Auto-boot a default device if nothing is booted, then refresh label.
   // We gate everything behind a preflight check so users on Macs without a
   // working Xcode toolchain see a single explanatory message instead of the
@@ -1258,55 +1580,264 @@ function activateSimPanel(panelHost, tab, panel) {
 }
 
 function deactivateSimPanel(panelHost) {
+  clearActiveCustomPanelFlag(panelHost);
   const tabWrap = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
-  const tab = tabWrap?.querySelector('[role="tab"]');
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
-  tabWrap?.removeAttribute("data-selected");
-  tab?.setAttribute("aria-selected", "false");
-  tab?.classList.remove("text-token-text-primary");
-  tab?.classList.add("text-token-text-secondary");
+  setSideTabSelected(tabWrap, false);
   if (panel instanceof HTMLElement) {
     panel.style.display = "none";
-    try {
-      panel.__codexppIosSimDetachCapture?.();
-    } catch {}
+    detachPanelCapture(panel);
   }
+  restoreNativePanels(panelHost);
+}
 
-  for (const nativePanel of panelHost.querySelectorAll(
-    ':scope > [role="tabpanel"]',
-  )) {
-    if (nativePanel === panel) continue;
-    const previous = nativePanel.getAttribute(
-      "data-codexpp-ios-sim-prev-display",
-    );
-    if (previous !== null) {
-      nativePanel.style.display = previous;
-      nativePanel.removeAttribute("data-codexpp-ios-sim-prev-display");
+function rightPanelRoot(panelHost) {
+  return panelHost?.closest?.('[data-app-shell-focus-area="right-panel"]') || panelHost;
+}
+
+function clearActiveCustomPanelFlag(panelHost) {
+  const root = rightPanelRoot(panelHost);
+  clearBodyActiveCustomPanelFlag();
+  if (root instanceof HTMLElement && root.hasAttribute(ACTIVE_CUSTOM_PANEL_ATTR)) {
+    root.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
+  }
+  const hosts = new Set();
+  if (panelHost instanceof HTMLElement) hosts.add(panelHost);
+  if (root instanceof HTMLElement) {
+    for (const host of root.querySelectorAll(`[${CUSTOM_PANEL_HOST_ATTR}]`)) {
+      if (host instanceof HTMLElement) hosts.add(host);
+    }
+  }
+  for (const host of hosts) {
+    if (host.hasAttribute(CUSTOM_PANEL_HOST_ATTR)) host.removeAttribute(CUSTOM_PANEL_HOST_ATTR);
+    if (host.hasAttribute(ACTIVE_CUSTOM_PANEL_ATTR)) {
+      host.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
     }
   }
 }
 
+function setActiveCustomPanelFlag(panelHost, activeAttr) {
+  const root = rightPanelRoot(panelHost);
+  setBodyActiveCustomPanelFlag(activeAttr);
+  if (
+    root instanceof HTMLElement &&
+    root.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr
+  ) {
+    root.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+  if (panelHost.getAttribute(CUSTOM_PANEL_HOST_ATTR) !== "true") {
+    panelHost.setAttribute(CUSTOM_PANEL_HOST_ATTR, "true");
+  }
+  if (panelHost.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr) {
+    panelHost.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+}
+
+function setBodyActiveCustomPanelFlag(activeAttr) {
+  if (!(document.body instanceof HTMLElement)) return;
+  if (document.body.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr) {
+    document.body.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+}
+
+function clearBodyActiveCustomPanelFlag() {
+  if (document.body instanceof HTMLElement) {
+    document.body.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
+  }
+}
+
+function selectedCustomTab(root) {
+  for (const tab of root.querySelectorAll(customTabSelector())) {
+    if (!(tab instanceof HTMLElement)) continue;
+    const roleTab = tab.querySelector('[role="tab"]');
+    if (tab.getAttribute("data-selected") === "true" || roleTab?.getAttribute("aria-selected") === "true") {
+      return tab;
+    }
+  }
+  return null;
+}
+
+function reconcileActiveCustomPanelFromDom() {
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
+  if (panelHost instanceof HTMLElement) reconcileActiveCustomPanel(panelHost);
+}
+
+function scheduleCustomPanelReconcile(panelHost) {
+  for (const delay of [0, 50, 150, 500]) {
+    setTimeout(() => reconcileActiveCustomPanel(panelHost), delay);
+  }
+}
+
+function reconcileActiveCustomPanel(panelHost) {
+  const root = rightPanelRoot(panelHost);
+  if (!(root instanceof HTMLElement)) return false;
+  const activeTab = selectedCustomTab(root);
+  if (!(activeTab instanceof HTMLElement)) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+  const activeAttr = CUSTOM_PANEL_ATTRS.find((attr) => activeTab.getAttribute(attr) === "side-tab");
+  if (!activeAttr) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+  const activePanel = root.querySelector(`[${activeAttr}="tabpanel"]`);
+  if (!(activePanel instanceof HTMLElement)) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+
+  setActiveCustomPanelFlag(panelHost, activeAttr);
+  for (const panel of Array.from(panelHost.children)) {
+    if (!(panel instanceof HTMLElement) || panel === activePanel) continue;
+    if (panel.matches(".h-toolbar, [role='status']")) continue;
+    if (isCustomPanel(panel)) {
+      if (panel.style.display !== "none") panel.style.display = "none";
+      detachPanelCapture(panel);
+      continue;
+    }
+    if (!panel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
+      panel.setAttribute(
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(panel) ?? panel.style.display ?? "",
+      );
+    }
+    clearLegacyPanelDisplayAttrs(panel);
+    if (panel.style.display !== "none") panel.style.display = "none";
+  }
+  for (const panel of root.querySelectorAll('[role="tabpanel"]')) {
+    if (!(panel instanceof HTMLElement) || panel === activePanel) continue;
+    if (isCustomPanel(panel)) {
+      if (panel.style.display !== "none") panel.style.display = "none";
+      detachPanelCapture(panel);
+      continue;
+    }
+    if (!panel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
+      panel.setAttribute(
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(panel) ?? panel.style.display ?? "",
+      );
+    }
+    clearLegacyPanelDisplayAttrs(panel);
+    if (panel.style.display !== "none") panel.style.display = "none";
+  }
+  if (activePanel.style.display !== "") activePanel.style.display = "";
+  return true;
+}
+
+function deactivateNativeBrowserSurface(panelHost) {
+  setBodyActiveCustomPanelFlag(TWEAK_ATTR);
+}
+
 function removeSimPanel() {
-  const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
 }
 
 function ensureSidePanelVisible() {
-  if (findRightTablist()) return;
-  const toggle = document.querySelector(
-    'button[aria-label="Toggle side panel"][aria-pressed="false"]',
-  );
-  if (toggle instanceof HTMLElement) toggle.click();
+  if (findRightTablist()) return true;
+  const toggle = findSidePanelToggle();
+  if (!(toggle instanceof HTMLElement)) return false;
+  if (toggle.hasAttribute("disabled") || toggle.getAttribute("aria-disabled") === "true") {
+    return false;
+  }
+  if (toggle.getAttribute("aria-pressed") === "true") return false;
+  toggle.click();
+  return true;
 }
 
 function findRightTablist() {
-  const addButton = document.querySelector(
-    'button[aria-label="Open side panel tab"]',
+  const customTab = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
+  const existing = customTab?.closest('[role="tablist"]');
+  if (existing instanceof HTMLElement) return existing;
+
+  const addButton = findSidePanelAddButton();
+  const toolbar = addButton?.closest(".h-toolbar-pane");
+  const toolbarTablist = toolbar?.querySelector('[role="tablist"]');
+  if (toolbarTablist instanceof HTMLElement) return toolbarTablist;
+
+  const rightPanelTablist = document.querySelector(
+    '[data-app-shell-focus-area="right-panel"] [role="tablist"]',
   );
-  const toolbar = addButton?.closest(".flex.h-toolbar-pane");
-  return toolbar?.querySelector('[role="tablist"]') || null;
+  if (rightPanelTablist instanceof HTMLElement) return rightPanelTablist;
+
+  for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+    if (!(tablist instanceof HTMLElement)) continue;
+    if (tablist.querySelector('[data-app-shell-tab-controller="right"]')) {
+      return tablist;
+    }
+  }
+
+  return null;
+}
+
+function findPanelHostForTablist(tablist) {
+  let node = tablist.parentElement;
+  while (node instanceof HTMLElement) {
+    try {
+      if (node.querySelector(':scope > [role="tabpanel"]')) return node;
+    } catch {}
+    if (node.getAttribute("data-app-shell-focus-area") === "right-panel") break;
+    node = node.parentElement;
+  }
+
+  const oldHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
+  if (oldHost instanceof HTMLElement && oldHost.querySelector(':scope > [role="tabpanel"]')) {
+    return oldHost;
+  }
+
+  const rightPanel = tablist.closest('[data-app-shell-focus-area="right-panel"]');
+  if (!(rightPanel instanceof HTMLElement)) return null;
+  const hosts = Array.from(rightPanel.querySelectorAll(".h-full.min-h-0.flex-col"));
+  return (
+    hosts.find(
+      (host) =>
+        host instanceof HTMLElement &&
+        host.contains(tablist) &&
+        host.querySelector(':scope > [role="tabpanel"]'),
+    ) || null
+  );
+}
+
+function findSidePanelAddButton() {
+  return findButtonByLabel("Open side panel tab");
+}
+
+function findSidePanelToggle() {
+  return findButtonByLabel("Toggle side panel");
+}
+
+function findButtonByLabel(label) {
+  const escaped = cssEscape(label);
+  const exact = document.querySelector(
+    `button[aria-label="${escaped}"],button[title="${escaped}"],[role="button"][aria-label="${escaped}"],[role="button"][title="${escaped}"]`,
+  );
+  if (exact instanceof HTMLElement) return exact;
+
+  for (const el of document.querySelectorAll("button,[role='button']")) {
+    if (!(el instanceof HTMLElement)) continue;
+    if (getControlLabel(el) === label) return el;
+  }
+  return null;
+}
+
+function getControlLabel(el) {
+  return (
+    el.getAttribute("aria-label") ||
+    el.getAttribute("title") ||
+    compactText(el.textContent || "")
+  );
+}
+
+function cssEscape(value) {
+  if (globalThis.CSS?.escape) return globalThis.CSS.escape(value);
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 // ── toolbar handlers ────────────────────────────────────────────────────
