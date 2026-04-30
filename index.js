@@ -19,9 +19,44 @@ const TWEAK_ATTR = "data-codexpp-ios-sim";
 const STYLE_ID = "codexpp-ios-sim-style";
 const MENU_LABEL = "iOS Simulator";
 const PANEL_LABEL = "iOS Simulator";
-const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
-const PICKER_TITLE_PATTERNS = [/^new chat$/i, /^open file$/i, /^browse files$/i];
+const BROWSER_PATTERNS = [
+  /^browser$/i,
+  /^browser use$/i,
+  /\bbrowser\b/i,
+  /浏览器/,
+  /瀏覽器/,
+];
+const MENU_FALLBACK_PATTERNS = [
+  /^open file$/i,
+  /^browse files$/i,
+  /打开文件/,
+  /開啟檔案/,
+];
+const PICKER_TITLE_PATTERNS = [
+  /^new chat$/i,
+  /新(建)?聊天/,
+  /新(建)?对话/,
+  ...MENU_FALLBACK_PATTERNS,
+];
 const PICKER_SUBTITLE = "Mirror the iOS Simulator in this pane";
+const HID_USAGE = {
+  Enter: 0x28,
+  Escape: 0x29,
+  Backspace: 0x2a,
+  Tab: 0x2b,
+  Space: 0x2c,
+  Delete: 0x4c,
+  ArrowRight: 0x4f,
+  ArrowLeft: 0x50,
+  ArrowDown: 0x51,
+  ArrowUp: 0x52,
+};
+const HID_MODIFIER_USAGE = {
+  Control: 0xe0,
+  Shift: 0xe1,
+  Alt: 0xe2,
+  Meta: 0xe3,
+};
 
 const PHONE_SVG =
   '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 rounded-2xs">' +
@@ -142,6 +177,7 @@ function registerMainHandlers(api, tweak) {
   const { ipcMain, webContents } = electron;
   const fs = require("node:fs");
   const path = require("node:path");
+  const buildDir = path.join(electron.app.getPath("userData"), "codex-plusplus-ios-simulator");
   const id = api.manifest?.id || "co.bennett.ios-simulator";
   const ch = (name) => `codexpp:${id}:${name}`;
   const channels = [
@@ -167,7 +203,7 @@ function registerMainHandlers(api, tweak) {
   // Capture state ------------------------------------------------------
   const helperDir = path.join(__dirname, "helpers");
   const swiftSrc = path.join(helperDir, "sim-capture.swift");
-  const helperBin = path.join(helperDir, "sim-capture");
+  const helperBin = path.join(buildDir, "sim-capture");
   const FRAME_CHANNEL = ch("ios-sim:capture:frame");
   const META_CHANNEL = ch("ios-sim:capture:meta");
   const STATUS_CHANNEL = ch("ios-sim:capture:status");
@@ -197,6 +233,7 @@ function registerMainHandlers(api, tweak) {
     if (!fs.existsSync(swiftSrc)) {
       return { ok: false, error: "missing sim-capture.swift" };
     }
+    fs.mkdirSync(buildDir, { recursive: true });
     let needsBuild = !fs.existsSync(helperBin);
     if (!needsBuild) {
       const a = fs.statSync(helperBin).mtimeMs;
@@ -288,12 +325,25 @@ function registerMainHandlers(api, tweak) {
         if (m) {
           try {
             const meta = JSON.parse(m[1]);
+            if (meta.type === "no-booted-device") {
+              capture.lastMeta = null;
+              stopInput("capture-no-booted-device");
+              broadcast(META_CHANNEL, meta);
+              continue;
+            }
             capture.lastMeta = meta;
+            if (meta.deviceUDID && input.proc && input.udid !== meta.deviceUDID) {
+              stopInput("capture-device-changed");
+            }
             broadcast(META_CHANNEL, meta);
           } catch (e) {
             api.log?.warn?.("ios-sim meta parse", e, line);
           }
         } else {
+          if (/booted device gone/i.test(line)) {
+            capture.lastMeta = null;
+            stopInput("capture-device-gone");
+          }
           api.log?.info?.("[sim-capture]", line);
         }
       }
@@ -315,14 +365,17 @@ function registerMainHandlers(api, tweak) {
 
   // Input helper -------------------------------------------------------
   const inputSrc = path.join(helperDir, "sim-input.m");
-  const inputBin = path.join(helperDir, "sim-input");
+  const inputBin = path.join(buildDir, "sim-input");
 
   const input = (globalThis.__codexppIosSimInput = globalThis.__codexppIosSimInput || {
     proc: null,
+    udid: null,
+    eventQueue: Promise.resolve(),
   });
 
   function ensureInputBinary() {
     if (!fs.existsSync(inputSrc)) return { ok: false, error: "missing sim-input.m" };
+    fs.mkdirSync(buildDir, { recursive: true });
     let needsBuild = !fs.existsSync(inputBin);
     if (!needsBuild) {
       const a = fs.statSync(inputBin).mtimeMs;
@@ -344,11 +397,15 @@ function registerMainHandlers(api, tweak) {
     return { ok: true };
   }
 
-  function ensureInputProc() {
-    if (input.proc && !input.proc.killed) return { ok: true };
+  function ensureInputProc(udid) {
+    const targetUDID = udid || null;
+    if (input.proc && !input.proc.killed && input.udid === targetUDID) return { ok: true };
+    if (input.proc && input.udid !== targetUDID) {
+      stopInput("target-device-changed");
+    }
     const built = ensureInputBinary();
     if (!built.ok) return built;
-    const proc = spawn(inputBin, [], { stdio: ["pipe", "ignore", "pipe"] });
+    const proc = spawn(inputBin, targetUDID ? [targetUDID] : [], { stdio: ["pipe", "ignore", "pipe"] });
     let stderrBuf = "";
     proc.stderr.on("data", (b) => {
       stderrBuf += b.toString("utf8");
@@ -356,7 +413,13 @@ function registerMainHandlers(api, tweak) {
       while ((nl = stderrBuf.indexOf("\n")) >= 0) {
         const line = stderrBuf.slice(0, nl);
         stderrBuf = stderrBuf.slice(nl + 1);
-        if (line.trim()) api.log?.info?.("[sim-input]", line.trim());
+        const trimmed = line.trim();
+        if (trimmed) {
+          api.log?.info?.("[sim-input]", trimmed);
+          if (/machPortInvalid/i.test(trimmed)) {
+            stopInput("input-mach-port-invalid");
+          }
+        }
       }
     });
     proc.on("error", (e) => {
@@ -368,21 +431,91 @@ function registerMainHandlers(api, tweak) {
       if (input.proc === proc) input.proc = null;
     });
     input.proc = proc;
+    input.udid = targetUDID;
     return { ok: true };
   }
 
-  function stopInput() {
+  function stopInput(reason) {
     if (input.proc) {
+      if (reason) api.log?.info?.("ios-sim stopping input helper", reason);
       try { input.proc.kill("SIGTERM"); } catch {}
       input.proc = null;
     }
+    input.udid = null;
+  }
+
+  function writeInputEvent(event) {
+    input.proc.stdin.write(JSON.stringify(event) + "\n");
+  }
+
+  function pbcopyToDevice(udid, text) {
+    const device = udid || "booted";
+    return new Promise((resolve) => {
+      const p = spawn("xcrun", ["simctl", "pbcopy", device], {
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      let err = "";
+      p.stderr.on("data", (b) => (err += b));
+      p.on("error", (e) => resolve({ ok: false, error: String(e) }));
+      p.on("exit", (code) =>
+        resolve({ ok: code === 0, code, error: err || undefined }),
+      );
+      try {
+        p.stdin.end(text);
+      } catch (e) {
+        resolve({ ok: false, error: String(e) });
+      }
+    });
+  }
+
+  async function sendTextInput(targetUDID, text) {
+    const value = String(text || "");
+    if (!value) return { ok: true };
+    if (value.length > 4096) return { ok: false, error: "text input too long" };
+
+    const copied = await pbcopyToDevice(targetUDID, value);
+    if (!copied.ok) return copied;
+
+    const r = ensureInputProc(targetUDID);
+    if (!r.ok) return r;
+    writeInputEvent({ type: "key-tap", usage: 0x19, modifiers: [0xe3] }); // Cmd+V
+    return { ok: true };
+  }
+
+  function enqueueTextInput(targetUDID, text) {
+    return enqueueInputOperation(() => sendTextInput(targetUDID, text));
+  }
+
+  function sendHelperInputEvent(targetUDID, event) {
+    const r = ensureInputProc(targetUDID);
+    if (!r.ok) return r;
+    try {
+      writeInputEvent(event);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }
+
+  function enqueueInputOperation(fn) {
+    const previous = input.eventQueue || Promise.resolve();
+    const next = previous.catch(() => {}).then(fn);
+    input.eventQueue = next;
+    return next;
   }
 
   ipcMain.handle(ch("ios-sim:input:event"), async (_evt, event) => {
-    const r = ensureInputProc();
+    const targetUDID = event?.deviceUDID || capture.lastMeta?.deviceUDID || null;
+    if (event?.type === "text") {
+      return enqueueTextInput(targetUDID, event.text);
+    }
+    if (event?.type === "keyboard" || event?.type === "key-tap") {
+      return enqueueInputOperation(() => sendHelperInputEvent(targetUDID, event));
+    }
+    const r = ensureInputProc(targetUDID);
     if (!r.ok) return r;
     try {
-      input.proc.stdin.write(JSON.stringify(event) + "\n");
+      writeInputEvent(event);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: String(e) };
@@ -498,6 +631,7 @@ function registerMainHandlers(api, tweak) {
 
   ipcMain.handle(ch("ios-sim:capture:stop"), async () => {
     stopCapture("client-stop");
+    stopInput("capture-stop");
     return { ok: true };
   });
 
@@ -622,8 +756,17 @@ function injectStyles() {
 
 function findBrowserMenuButtons() {
   const found = new Set();
+  const menuAnchors = new Map();
+  const rememberMenuAnchor = (node, rank) => {
+    const root = menuRootForCandidate(node);
+    const existing = menuAnchors.get(root);
+    if (!existing || rank < existing.rank) {
+      menuAnchors.set(root, { node, rank });
+    }
+  };
 
-  // Legacy: native Codex menu with a "Browser" entry.
+  // Native Codex right-panel menu. Prefer "Browser"; if it is already open,
+  // Codex hides that entry, so fall back to the always-present file row.
   const radixCandidates = Array.from(
     document.querySelectorAll(
       '[role="menuitem"], [role="menu"] button, [data-radix-popper-content-wrapper] button',
@@ -633,12 +776,22 @@ function findBrowserMenuButtons() {
     if (!(node instanceof HTMLElement)) continue;
     if (node.getAttribute(TWEAK_ATTR)) continue;
     if (!isMenuCandidate(node)) continue;
+    const label = extractLabel(node);
+    const text = compactText(node.textContent || "");
     if (
-      matchesBrowserText(extractLabel(node)) ||
-      matchesBrowserText(compactText(node.textContent || ""))
+      matchesBrowserText(label) ||
+      matchesBrowserText(text)
     ) {
-      found.add(node);
+      rememberMenuAnchor(node, 0);
+    } else if (
+      matchesMenuFallbackText(label) ||
+      matchesMenuFallbackText(text)
+    ) {
+      rememberMenuAnchor(node, 1);
     }
+  }
+  for (const { node } of menuAnchors.values()) {
+    found.add(node);
   }
 
   // codex-spitscreen picker dialog: clone the "New chat" picker row.
@@ -669,6 +822,16 @@ function findBrowserMenuButtons() {
   return Array.from(found);
 }
 
+function menuRootForCandidate(node) {
+  return (
+    node.closest(
+      '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align], [role="dialog"]',
+    ) ||
+    node.parentElement ||
+    node
+  );
+}
+
 function isMenuCandidate(node) {
   if (node.closest('[role="tablist"], [role="tabpanel"]')) return false;
   if (node.getAttribute("role") === "menuitem") return true;
@@ -694,9 +857,7 @@ function rewriteMenuLabel(button) {
   // Browser-style entries: replace inline "Browser" → "iOS Simulator".
   for (const node of textNodes) {
     if (matchesBrowserText(compactText(node.nodeValue || ""))) {
-      node.nodeValue = (node.nodeValue || "")
-        .replace(/Browser use/i, MENU_LABEL)
-        .replace(/Browser/i, MENU_LABEL);
+      replaceTextNodeLabel(node, MENU_LABEL);
       removeShortcutHints(button);
       return;
     }
@@ -707,8 +868,8 @@ function rewriteMenuLabel(button) {
   for (const node of textNodes) {
     const t = compactText(node.nodeValue || "");
     if (!t) continue;
-    if (!setTitle && PICKER_TITLE_PATTERNS.some((p) => p.test(t.replace(/^\+/, "")))) {
-      node.nodeValue = (node.nodeValue || "").replace(/(\+?)[A-Za-z][^\n]*/, "$1" + MENU_LABEL);
+    if (!setTitle && matchesPickerTitleText(t.replace(/^\+/, ""))) {
+      replaceTextNodeLabel(node, MENU_LABEL);
       setTitle = true;
       continue;
     }
@@ -719,6 +880,14 @@ function rewriteMenuLabel(button) {
     }
   }
   removeShortcutHints(button);
+}
+
+function replaceTextNodeLabel(node, label) {
+  const value = node.nodeValue || "";
+  const leading = value.match(/^\s*/)?.[0] || "";
+  const trailing = value.match(/\s*$/)?.[0] || "";
+  const prefix = value.trim().startsWith("+") ? "+" : "";
+  node.nodeValue = `${leading}${prefix}${label}${trailing}`;
 }
 
 function rewriteMenuIcon(button) {
@@ -765,15 +934,22 @@ function openSimPanel(api) {
   ensureSidePanelVisible();
   // NOTE: requestAnimationFrame is paused when the window is unfocused, which
   // prevented mounting when the user tabbed away. setTimeout fires regardless.
-  setTimeout(() => {
+  const startedAt = Date.now();
+  const tryMount = () => {
     let mounted = false;
     try {
       mounted = mountSimPanel(api);
     } catch (err) {
       api?.log?.error?.("ios-sim mountSimPanel threw", String(err?.stack || err));
     }
-    if (!mounted) api?.log?.warn?.("ios-sim could not find side panel host");
-  }, 16);
+    if (mounted) return;
+    if (Date.now() - startedAt < 1_500) {
+      setTimeout(tryMount, 50);
+      return;
+    }
+    api?.log?.warn?.("ios-sim could not find side panel host");
+  };
+  setTimeout(tryMount, 16);
 }
 
 function mountSimPanel(api) {
@@ -904,6 +1080,7 @@ function createSideTab() {
 
 function closeSimTab() {
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.__codexppIosSimDisposeKeyboard?.();
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
@@ -981,8 +1158,9 @@ function createPanel(api) {
 
   toolbar.appendChild(
     makeToolbarButton({
-      label: "Home",
+      label: "返回桌面",
       icon: SVGS.home,
+      text: "桌面",
       onClick: () => onHardwareButton(panel, api, "home"),
     }),
   );
@@ -1015,12 +1193,14 @@ function createPanel(api) {
   const mirror = document.createElement("img");
   mirror.alt = "iOS Simulator";
   mirror.draggable = false;
+  mirror.tabIndex = 0;
   mirror.style.maxWidth = "100%";
   mirror.style.maxHeight = "100%";
   mirror.style.objectFit = "contain";
   mirror.style.display = "none";
   mirror.style.userSelect = "none";
   mirror.style.touchAction = "none";
+  mirror.style.outline = "none";
   mirror.style.borderRadius = "18px";
   mirror.style.boxShadow = "0 10px 40px rgba(0,0,0,0.35)";
   stage.appendChild(mirror);
@@ -1038,11 +1218,16 @@ function createPanel(api) {
     return { x, y };
   }
   function send(event) {
-    try { api.ipc.invoke("ios-sim:input:event", event).catch(() => {}); } catch {}
+    const meta = panel.__codexppIosSimMeta;
+    const payload = meta?.deviceUDID && !event.deviceUDID
+      ? { ...event, deviceUDID: meta.deviceUDID }
+      : event;
+    try { api.ipc.invoke("ios-sim:input:event", payload).catch(() => {}); } catch {}
   }
   mirror.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     const r = imgRatio(e); if (!r) return;
+    panel.__codexppIosSimActivateKeyboard?.();
     pointerDown = true;
     activePointerId = e.pointerId;
     try { mirror.setPointerCapture(e.pointerId); } catch {}
@@ -1065,6 +1250,7 @@ function createPanel(api) {
   mirror.addEventListener("pointerup", endPointer);
   mirror.addEventListener("pointercancel", endPointer);
   mirror.addEventListener("contextmenu", (e) => e.preventDefault());
+  installKeyboardForwarding(panel, mirror, stage, send);
 
   const placeholder = document.createElement("div");
   placeholder.className =
@@ -1189,6 +1375,232 @@ function makeToolbarButton({ label, icon, text, onClick }) {
   return b;
 }
 
+function installKeyboardForwarding(panel, mirror, stage, send) {
+  const sink = document.createElement("textarea");
+  sink.setAttribute(TWEAK_ATTR, "keyboard-sink");
+  sink.setAttribute("aria-hidden", "true");
+  sink.autocapitalize = "off";
+  sink.autocomplete = "off";
+  sink.spellcheck = false;
+  sink.tabIndex = -1;
+  sink.style.position = "absolute";
+  sink.style.width = "1px";
+  sink.style.height = "1px";
+  sink.style.opacity = "0";
+  sink.style.pointerEvents = "none";
+  sink.style.left = "50%";
+  sink.style.top = "50%";
+  sink.style.resize = "none";
+  sink.style.border = "0";
+  sink.style.padding = "0";
+  sink.style.outline = "0";
+  stage.appendChild(sink);
+
+  let keyboardActive = false;
+  let composing = false;
+  let queuedText = "";
+  let textTimer = null;
+
+  const isVisible = () => panel.isConnected && panel.style.display !== "none";
+  const focusSink = () => {
+    try { sink.focus({ preventScroll: true }); } catch { try { sink.focus(); } catch {} }
+  };
+  const stopEvent = (event, preventDefault = true) => {
+    if (preventDefault) event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+  };
+  const flushText = () => {
+    if (textTimer) {
+      clearTimeout(textTimer);
+      textTimer = null;
+    }
+    const text = queuedText;
+    queuedText = "";
+    if (text) send({ type: "text", text });
+  };
+  const queueText = (text) => {
+    if (!text) return;
+    queuedText += text;
+    if (textTimer) clearTimeout(textTimer);
+    textTimer = setTimeout(flushText, 30);
+  };
+  const sendKeyTap = (usage, modifiers = []) => {
+    flushText();
+    send({ type: "key-tap", usage, modifiers });
+  };
+  const activate = () => {
+    if (!isVisible()) return;
+    keyboardActive = true;
+    focusSink();
+  };
+  const deactivate = () => {
+    flushText();
+    keyboardActive = false;
+    composing = false;
+    sink.value = "";
+    if (document.activeElement === sink) {
+      try { sink.blur(); } catch {}
+    }
+  };
+  const active = () => keyboardActive && isVisible();
+
+  panel.__codexppIosSimActivateKeyboard = activate;
+  panel.__codexppIosSimDeactivateKeyboard = deactivate;
+
+  const onBeforeInput = (event) => {
+    if (!active()) return;
+    if (event.inputType === "insertCompositionText") return;
+    if (event.inputType === "insertText" || event.inputType === "insertReplacementText") {
+      stopEvent(event);
+      queueText(event.data || sink.value);
+      sink.value = "";
+      return;
+    }
+    if (event.inputType === "insertLineBreak") {
+      stopEvent(event);
+      sendKeyTap(HID_USAGE.Enter);
+      return;
+    }
+    if (event.inputType === "deleteContentBackward") {
+      stopEvent(event);
+      sendKeyTap(HID_USAGE.Backspace);
+      return;
+    }
+    if (event.inputType === "deleteContentForward") {
+      stopEvent(event);
+      sendKeyTap(HID_USAGE.Delete);
+    }
+  };
+
+  const onInput = () => {
+    if (!active() || composing) return;
+    const text = sink.value;
+    sink.value = "";
+    queueText(text);
+  };
+
+  const onCompositionStart = () => {
+    if (active()) composing = true;
+  };
+
+  const onCompositionEnd = (event) => {
+    if (!active()) return;
+    composing = false;
+    const text = event.data || sink.value;
+    sink.value = "";
+    queueText(text);
+  };
+
+  const onPaste = (event) => {
+    if (!active()) return;
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (!text) return;
+    stopEvent(event);
+    queueText(text);
+  };
+
+  const onDocumentMouseDown = (event) => {
+    if (!keyboardActive) return;
+    const target = event.target instanceof Node ? event.target : null;
+    if (target && panel.contains(target)) return;
+    deactivate();
+  };
+
+  const onDocumentKeyDown = (event) => {
+    if (!active()) return;
+    if (document.activeElement !== sink) focusSink();
+
+    if (event.isComposing || composing) {
+      stopEvent(event, false);
+      return;
+    }
+
+    const usage = hidUsageForKeyboardEvent(event);
+    const printable = event.key && event.key.length === 1 && !event.metaKey && !event.ctrlKey;
+    if (printable) {
+      if (event.target === sink) {
+        stopEvent(event, false);
+      } else {
+        stopEvent(event);
+        queueText(event.key);
+      }
+      return;
+    }
+
+    if (!usage) return;
+    stopEvent(event);
+    sendKeyTap(usage, hidModifierUsagesForEvent(event));
+  };
+
+  sink.addEventListener("beforeinput", onBeforeInput);
+  sink.addEventListener("input", onInput);
+  sink.addEventListener("compositionstart", onCompositionStart);
+  sink.addEventListener("compositionend", onCompositionEnd);
+  sink.addEventListener("paste", onPaste);
+  document.addEventListener("mousedown", onDocumentMouseDown, true);
+  document.addEventListener("keydown", onDocumentKeyDown, true);
+
+  panel.__codexppIosSimDisposeKeyboard = () => {
+    deactivate();
+    sink.removeEventListener("beforeinput", onBeforeInput);
+    sink.removeEventListener("input", onInput);
+    sink.removeEventListener("compositionstart", onCompositionStart);
+    sink.removeEventListener("compositionend", onCompositionEnd);
+    sink.removeEventListener("paste", onPaste);
+    document.removeEventListener("mousedown", onDocumentMouseDown, true);
+    document.removeEventListener("keydown", onDocumentKeyDown, true);
+    sink.remove();
+  };
+}
+
+function hidUsageForKeyboardEvent(event) {
+  if (!event) return null;
+  if (Object.prototype.hasOwnProperty.call(HID_USAGE, event.key)) {
+    return HID_USAGE[event.key];
+  }
+  const code = event.code || "";
+  const keyMatch = code.match(/^Key([A-Z])$/);
+  if (keyMatch) return 0x04 + keyMatch[1].charCodeAt(0) - 65;
+  const digitMatch = code.match(/^Digit([0-9])$/);
+  if (digitMatch) {
+    const digit = Number(digitMatch[1]);
+    return digit === 0 ? 0x27 : 0x1d + digit;
+  }
+  const codeMap = {
+    Minus: 0x2d,
+    Equal: 0x2e,
+    BracketLeft: 0x2f,
+    BracketRight: 0x30,
+    Backslash: 0x31,
+    Semicolon: 0x33,
+    Quote: 0x34,
+    Backquote: 0x35,
+    Comma: 0x36,
+    Period: 0x37,
+    Slash: 0x38,
+    Home: 0x4a,
+    PageUp: 0x4b,
+    End: 0x4d,
+    PageDown: 0x4e,
+  };
+  if (Object.prototype.hasOwnProperty.call(codeMap, code)) return codeMap[code];
+  if (Object.prototype.hasOwnProperty.call(HID_MODIFIER_USAGE, event.key)) {
+    return HID_MODIFIER_USAGE[event.key];
+  }
+  return null;
+}
+
+function hidModifierUsagesForEvent(event) {
+  const usage = hidUsageForKeyboardEvent(event);
+  const modifiers = [];
+  if (event.ctrlKey && usage !== HID_MODIFIER_USAGE.Control) modifiers.push(HID_MODIFIER_USAGE.Control);
+  if (event.shiftKey && usage !== HID_MODIFIER_USAGE.Shift) modifiers.push(HID_MODIFIER_USAGE.Shift);
+  if (event.altKey && usage !== HID_MODIFIER_USAGE.Alt) modifiers.push(HID_MODIFIER_USAGE.Alt);
+  if (event.metaKey && usage !== HID_MODIFIER_USAGE.Meta) modifiers.push(HID_MODIFIER_USAGE.Meta);
+  return modifiers;
+}
+
 function activateSimPanel(panelHost, tab, panel) {
   for (const nativePanel of panelHost.querySelectorAll(
     ':scope > [role="tabpanel"]',
@@ -1266,6 +1678,9 @@ function deactivateSimPanel(panelHost) {
   tab?.classList.remove("text-token-text-primary");
   tab?.classList.add("text-token-text-secondary");
   if (panel instanceof HTMLElement) {
+    try {
+      panel.__codexppIosSimDeactivateKeyboard?.();
+    } catch {}
     panel.style.display = "none";
     try {
       panel.__codexppIosSimDetachCapture?.();
@@ -1288,6 +1703,7 @@ function deactivateSimPanel(panelHost) {
 
 function removeSimPanel() {
   const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.__codexppIosSimDisposeKeyboard?.();
   if (panelHost instanceof HTMLElement) deactivateSimPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
@@ -1295,18 +1711,40 @@ function removeSimPanel() {
 
 function ensureSidePanelVisible() {
   if (findRightTablist()) return;
-  const toggle = document.querySelector(
-    'button[aria-label="Toggle side panel"][aria-pressed="false"]',
+  const toggle = findButtonByAriaLabel(
+    /^(Toggle side panel|显示\/隐藏侧边栏|切换側邊面板)$/,
+    '[aria-pressed="false"]',
   );
   if (toggle instanceof HTMLElement) toggle.click();
 }
 
 function findRightTablist() {
-  const addButton = document.querySelector(
-    'button[aria-label="Open side panel tab"]',
+  const addButton = findButtonByAriaLabel(
+    /^(Open side panel tab|打开侧边面板标签页|開啟側邊面板分頁)$/,
   );
   const toolbar = addButton?.closest(".flex.h-toolbar-pane");
-  return toolbar?.querySelector('[role="tablist"]') || null;
+  const localizedTablist = toolbar?.querySelector('[role="tablist"]');
+  if (localizedTablist instanceof HTMLElement) return localizedTablist;
+
+  for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+    if (!(tablist instanceof HTMLElement)) continue;
+    const host = tablist.closest(".flex.h-full.min-h-0.flex-col");
+    if (!(host instanceof HTMLElement)) continue;
+    if (host.querySelector(':scope > [role="tabpanel"]')) return tablist;
+    if (tablist.closest(".flex.h-toolbar-pane")) return tablist;
+  }
+
+  return null;
+}
+
+function findButtonByAriaLabel(pattern, extraSelector = "") {
+  const selector = `button[aria-label]${extraSelector}`;
+  for (const button of document.querySelectorAll(selector)) {
+    if (!(button instanceof HTMLElement)) continue;
+    const label = button.getAttribute("aria-label") || "";
+    if (pattern.test(label)) return button;
+  }
+  return null;
 }
 
 // ── toolbar handlers ────────────────────────────────────────────────────
@@ -1647,6 +2085,14 @@ function extractLabel(node) {
 
 function matchesBrowserText(value) {
   return BROWSER_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function matchesMenuFallbackText(value) {
+  return MENU_FALLBACK_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function matchesPickerTitleText(value) {
+  return PICKER_TITLE_PATTERNS.some((pattern) => pattern.test(value));
 }
 
 function compactText(value) {
