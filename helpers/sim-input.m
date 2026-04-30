@@ -8,6 +8,8 @@
 // Event schema (one JSON object per line):
 //   {"type":"touch","phase":"down|move|up","x":0..1,"y":0..1}
 //   {"type":"button","name":"home|lock|side|siri","phase":"down|up"}
+//   {"type":"keyboard","usage":40,"phase":"down|up"} // USB HID usage code
+//   {"type":"key-tap","usage":40,"modifiers":[227]}  // optional modifier usages
 //   {"type":"tap","x":0..1,"y":0..1,"hold":150}      // convenience
 //   {"type":"button-tap","name":"home"}              // convenience
 //
@@ -110,6 +112,7 @@ typedef struct {
 // Indigo C-function pointer types
 typedef IndigoMessage *(*IndigoButtonFn)(int keyCode, int op, int target);
 typedef IndigoMessage *(*IndigoMouseFn)(CGPoint *point0, CGPoint *point1, int target, int eventType, BOOL extra);
+typedef IndigoMessage *(*IndigoKeyboardFn)(uint32_t usageCode, int op);
 
 // ───────────────────────────────────────────────────────────────────────────
 // Logging
@@ -159,11 +162,18 @@ static id defaultDeviceSet(id ctx) {
     return ds;
 }
 
+static NSString *gTargetUDID = nil;
+
 static id bootedDevice(id deviceSet) {
     NSArray *devices = [deviceSet valueForKey:@"devices"];
     for (id d in devices) {
         NSNumber *st = [d valueForKey:@"state"];
-        if (st.intValue == 3) return d; // Booted
+        if (st.intValue != 3) continue; // Booted
+        if (gTargetUDID.length) {
+            NSString *udid = [[d valueForKey:@"UDID"] description];
+            if (![udid isEqualToString:gTargetUDID]) continue;
+        }
+        return d;
     }
     return nil;
 }
@@ -175,6 +185,7 @@ static id bootedDevice(id deviceSet) {
 static id gHidClient = nil;
 static IndigoButtonFn gButtonFn = NULL;
 static IndigoMouseFn  gMouseFn  = NULL;
+static IndigoKeyboardFn gKeyboardFn = NULL;
 static dispatch_queue_t gSendQueue;
 
 static BOOL ensureHID(void) {
@@ -192,15 +203,20 @@ static BOOL ensureHID(void) {
     }
     gButtonFn = (IndigoButtonFn) dlsym(kit, "IndigoHIDMessageForButton");
     gMouseFn  = (IndigoMouseFn)  dlsym(kit, "IndigoHIDMessageForMouseNSEvent");
-    if (!gButtonFn || !gMouseFn) {
-        elog(@"[sim-input] FAIL Indigo dlsym button=%p mouse=%p", gButtonFn, gMouseFn);
+    gKeyboardFn = (IndigoKeyboardFn) dlsym(kit, "IndigoHIDMessageForKeyboardArbitrary");
+    if (!gButtonFn || !gMouseFn || !gKeyboardFn) {
+        elog(@"[sim-input] FAIL Indigo dlsym button=%p mouse=%p keyboard=%p", gButtonFn, gMouseFn, gKeyboardFn);
         return NO;
     }
 
     id ctx = sharedServiceContext(); if (!ctx) return NO;
     id ds  = defaultDeviceSet(ctx);  if (!ds)  return NO;
     id dev = bootedDevice(ds);
-    if (!dev) { elog(@"[sim-input] no booted device"); return NO; }
+    if (!dev) {
+        if (gTargetUDID.length) elog(@"[sim-input] no booted device matching %@", gTargetUDID);
+        else elog(@"[sim-input] no booted device");
+        return NO;
+    }
 
     Class clientCls = objc_lookUpClass("_TtC12SimulatorKit24SimDeviceLegacyHIDClient");
     if (!clientCls) clientCls = NSClassFromString(@"SimulatorKit.SimDeviceLegacyHIDClient");
@@ -214,7 +230,7 @@ static BOOL ensureHID(void) {
     if (!client) { elog(@"[sim-input] FAIL init HID client: %@", err); return NO; }
     gHidClient = client;
     gSendQueue = dispatch_queue_create("co.bennett.ios-sim.input", DISPATCH_QUEUE_SERIAL);
-    elog(@"[sim-input] HID client ready dev=%@", [dev valueForKey:@"name"]);
+    elog(@"[sim-input] HID client ready dev=%@ udid=%@", [dev valueForKey:@"name"], [dev valueForKey:@"UDID"]);
     return YES;
 }
 
@@ -280,6 +296,32 @@ static void sendButton(NSString *name, BOOL down) {
     sendIndigo(m);
 }
 
+static void sendKeyboard(uint32_t usage, BOOL down) {
+    if (!gKeyboardFn) return;
+    int op = down ? ButtonEventTypeDown : ButtonEventTypeUp;
+    IndigoMessage *m = gKeyboardFn(usage, op);
+    sendIndigo(m);
+}
+
+static void sendKeyTap(uint32_t usage, NSArray *modifiers) {
+    NSMutableArray *validModifiers = [NSMutableArray new];
+    for (id value in modifiers ?: @[]) {
+        if (![value respondsToSelector:@selector(unsignedIntValue)]) continue;
+        NSNumber *usageNumber = @([value unsignedIntValue]);
+        [validModifiers addObject:usageNumber];
+        sendKeyboard(usageNumber.unsignedIntValue, YES);
+    }
+
+    sendKeyboard(usage, YES);
+    usleep(10000);
+    sendKeyboard(usage, NO);
+
+    for (NSInteger i = (NSInteger)validModifiers.count - 1; i >= 0; i--) {
+        NSNumber *usageNumber = validModifiers[(NSUInteger)i];
+        sendKeyboard(usageNumber.unsignedIntValue, NO);
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // stdin event loop
 // ───────────────────────────────────────────────────────────────────────────
@@ -308,6 +350,16 @@ static void processEvent(NSDictionary *evt) {
         sendButton(name, YES);
         usleep(80000);
         sendButton(name, NO);
+    } else if ([type isEqualToString:@"keyboard"]) {
+        NSNumber *usage = evt[@"usage"];
+        if (!usage) { elog(@"[sim-input] keyboard missing usage"); return; }
+        NSString *phase = evt[@"phase"] ?: @"down";
+        sendKeyboard(usage.unsignedIntValue, [phase isEqualToString:@"down"]);
+    } else if ([type isEqualToString:@"key-tap"]) {
+        NSNumber *usage = evt[@"usage"];
+        if (!usage) { elog(@"[sim-input] key-tap missing usage"); return; }
+        NSArray *modifiers = [evt[@"modifiers"] isKindOfClass:NSArray.class] ? evt[@"modifiers"] : @[];
+        sendKeyTap(usage.unsignedIntValue, modifiers);
     } else {
         elog(@"[sim-input] unknown event type: %@", type);
     }
@@ -315,6 +367,10 @@ static void processEvent(NSDictionary *evt) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (argc > 1 && argv[1] && argv[1][0]) {
+            gTargetUDID = [NSString stringWithUTF8String:argv[1]];
+            elog(@"[sim-input] target udid=%@", gTargetUDID);
+        }
         // Pre-warm: try to attach now so first event has no latency
         ensureHID();
         elog(@"[sim-input] ready");
